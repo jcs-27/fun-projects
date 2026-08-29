@@ -1,0 +1,372 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Fractal Explorer</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root {
+    --bg: #08090d; --panel: rgba(20, 22, 30, 0.78); --text: #e8e9ee;
+    --muted: #9aa0ad; --accent-strong: #38bdf8; --accent: #7dd3fc;
+    --border: rgba(255,255,255,0.10);
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; width: 100%; height: 100%; background: var(--bg); overflow: hidden; }
+  body { font-family: -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; color: var(--text); }
+  #stage { display: block; width: 100vw; height: 100vh; background: #000; cursor: grab; }
+  #stage.dragging { cursor: grabbing; }
+
+  .panel {
+    position: fixed; top: 16px; left: 16px;
+    background: var(--panel); border: 1px solid var(--border); border-radius: 12px;
+    padding: 14px 16px; backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px);
+    display: flex; flex-direction: column; gap: 10px; min-width: 230px;
+  }
+  .panel h1 { font-size: 13px; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase; color: var(--muted); margin: 0; }
+  .row { display: flex; gap: 8px; }
+  button {
+    flex: 1; background: rgba(255,255,255,0.06); color: var(--text);
+    border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px;
+    font-size: 13px; cursor: pointer; transition: background 0.15s ease;
+  }
+  button:hover { background: rgba(255,255,255,0.12); }
+  button.primary { background: var(--accent-strong); color: #07131a; border-color: var(--accent-strong); font-weight: 600; }
+  button.primary:hover { background: var(--accent); }
+  label { font-size: 12px; color: var(--muted); display: flex; justify-content: space-between; }
+  input[type="range"] { width: 100%; accent-color: var(--accent-strong); }
+  select {
+    width: 100%; background: rgba(255,255,255,0.06); color: var(--text);
+    border: 1px solid var(--border); border-radius: 8px; padding: 6px 8px; font-size: 13px;
+  }
+  .checkrow { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--muted); }
+  .hint { font-size: 11px; color: var(--muted); line-height: 1.5; }
+  .readout { font-size: 11px; color: var(--muted); font-variant-numeric: tabular-nums; white-space: pre-line; }
+  .status {
+    position: fixed; top: 16px; right: 16px; background: var(--panel);
+    border: 1px solid var(--border); border-radius: 8px; padding: 6px 12px;
+    font-size: 12px; color: var(--accent); display: none;
+  }
+  .status.visible { display: block; }
+  #juliaPreview {
+    position: fixed; bottom: 16px; right: 16px; border: 1px solid var(--border);
+    border-radius: 8px; background: #000; display: none;
+  }
+  #juliaPreview.visible { display: block; }
+  .juliaLabel {
+    position: fixed; bottom: 200px; right: 16px; font-size: 11px; color: var(--muted); display: none;
+  }
+  .juliaLabel.visible { display: block; }
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<canvas id="juliaPreview" width="180" height="180"></canvas>
+<div class="juliaLabel" id="juliaLabel">Julia set at cursor</div>
+<div class="status" id="status">Rendering…</div>
+
+<div class="panel">
+  <h1>Fractal Explorer</h1>
+  <div class="row">
+    <button class="primary" id="resetBtn">⟲ Reset view</button>
+    <button id="saveBtn">⬇ Save PNG</button>
+  </div>
+  <label>Palette
+    <select id="paletteSelect">
+      <option value="fire">Fire</option>
+      <option value="ocean" selected>Ocean</option>
+      <option value="neon">Neon</option>
+      <option value="mono">Monochrome</option>
+    </select>
+  </label>
+  <label>Detail (max iterations) <span id="iterLabel">200</span>
+    <input type="range" id="iterSlider" min="50" max="1000" step="10" value="200">
+  </label>
+  <div class="checkrow">
+    <input type="checkbox" id="juliaToggle">
+    <label for="juliaToggle" style="margin:0;">Live Julia preview on hover</label>
+  </div>
+  <div class="hint">Scroll to zoom toward the cursor. Click and drag to pan. Higher detail looks better zoomed in but renders slower.</div>
+  <div class="readout" id="readout"></div>
+</div>
+
+<script>
+(() => {
+  "use strict";
+
+  const canvas = document.getElementById("stage");
+  const ctx = canvas.getContext("2d");
+  const juliaCanvas = document.getElementById("juliaPreview");
+  const juliaCtx = juliaCanvas.getContext("2d");
+  const statusEl = document.getElementById("status");
+  const readoutEl = document.getElementById("readout");
+
+  let dpr = Math.max(1, Math.min(2, window.devicePixelRatio || 1));
+  let W = 0, H = 0;
+
+  const DEFAULT_VIEW = { centerX: -0.5, centerY: 0, viewWidth: 3.2 };
+  let view = { ...DEFAULT_VIEW };
+  let maxIter = 200;
+  let paletteName = "ocean";
+  let juliaEnabled = false;
+
+  // -----------------------------------------------------------------
+  // palettes: smooth gradients built from a handful of stops, indexed
+  // by a normalized escape-time value in [0, 1). Interior (never
+  // escaped) points are always pure black.
+  // -----------------------------------------------------------------
+  const PALETTES = {
+    fire: [[0,0,0],[80,0,0],[180,40,0],[255,140,0],[255,220,80],[255,255,220]],
+    ocean: [[2,4,20],[0,40,90],[0,110,160],[60,190,210],[190,240,240],[255,255,255]],
+    neon: [[10,0,20],[90,0,120],[200,0,180],[0,220,220],[180,255,80],[255,255,255]],
+    mono: [[0,0,0],[60,60,60],[120,120,120],[190,190,190],[230,230,230],[255,255,255]],
+  };
+
+  function lerp(a, b, t) { return a + (b - a) * t; }
+
+  function paletteColor(t, palette) {
+    // t in [0,1) maps across the stop array
+    const stops = PALETTES[palette];
+    const scaled = t * (stops.length - 1);
+    const i = Math.min(stops.length - 2, Math.floor(scaled));
+    const frac = scaled - i;
+    const a = stops[i], b = stops[i + 1];
+    return [
+      Math.round(lerp(a[0], b[0], frac)),
+      Math.round(lerp(a[1], b[1], frac)),
+      Math.round(lerp(a[2], b[2], frac)),
+    ];
+  }
+
+  // -----------------------------------------------------------------
+  // escape-time iteration with smooth (continuous) coloring
+  // -----------------------------------------------------------------
+  function escapeSmooth(cRe, cIm, maxIterations, startRe, startIm) {
+    let zr = startRe, zi = startIm;
+    let n = 0;
+    while (n < maxIterations) {
+      const zr2 = zr * zr, zi2 = zi * zi;
+      if (zr2 + zi2 > 4) {
+        // smooth/continuous escape-time formula
+        const logZn = Math.log(zr2 + zi2) / 2;
+        const nu = Math.log(logZn / Math.LN2) / Math.LN2;
+        return n + 1 - nu;
+      }
+      zi = 2 * zr * zi + cIm;
+      zr = zr2 - zi2 + cRe;
+      n++;
+    }
+    return -1; // never escaped: interior point
+  }
+
+  function pixelToComplex(px, py, v, w, h) {
+    const scale = v.viewWidth / w;
+    return {
+      re: v.centerX + (px - w / 2) * scale,
+      im: v.centerY + (py - h / 2) * scale,
+    };
+  }
+
+  // -----------------------------------------------------------------
+  // main render (Mandelbrot: z0 = 0, c = pixel's complex coordinate)
+  // -----------------------------------------------------------------
+  function renderMandelbrot() {
+    const w = canvas.width, h = canvas.height;
+    const img = ctx.createImageData(w, h);
+    const data = img.data;
+    const scale = view.viewWidth / w;
+
+    for (let py = 0; py < h; py++) {
+      const im0 = view.centerY + (py - h / 2) * scale;
+      for (let px = 0; px < w; px++) {
+        const re0 = view.centerX + (px - w / 2) * scale;
+        const t = escapeSmooth(re0, im0, maxIter, 0, 0);
+        const idx = (py * w + px) * 4;
+        if (t < 0) {
+          data[idx] = data[idx + 1] = data[idx + 2] = 0;
+        } else {
+          const norm = (t % 40) / 40; // banded cycling so detail stays visible at any iteration count
+          const [r, g, b] = paletteColor(norm, paletteName);
+          data[idx] = r; data[idx + 1] = g; data[idx + 2] = b;
+        }
+        data[idx + 3] = 255;
+      }
+    }
+    ctx.putImageData(img, 0, 0);
+  }
+
+  function renderJulia(cRe, cIm) {
+    const w = juliaCanvas.width, h = juliaCanvas.height;
+    const img = juliaCtx.createImageData(w, h);
+    const data = img.data;
+    const juliaViewWidth = 3.2;
+    const scale = juliaViewWidth / w;
+    const juliaIter = Math.min(150, maxIter);
+
+    for (let py = 0; py < h; py++) {
+      const zi0 = (py - h / 2) * scale;
+      for (let px = 0; px < w; px++) {
+        const zr0 = (px - w / 2) * scale;
+        const t = escapeSmooth(cRe, cIm, juliaIter, zr0, zi0);
+        const idx = (py * w + px) * 4;
+        if (t < 0) {
+          data[idx] = data[idx + 1] = data[idx + 2] = 0;
+        } else {
+          const norm = (t % 40) / 40;
+          const [r, g, b] = paletteColor(norm, paletteName);
+          data[idx] = r; data[idx + 1] = g; data[idx + 2] = b;
+        }
+        data[idx + 3] = 255;
+      }
+    }
+    juliaCtx.putImageData(img, 0, 0);
+  }
+
+  // -----------------------------------------------------------------
+  // render scheduling: this is a render-ON-DEMAND page, not a
+  // requestAnimationFrame animation loop — it redraws only when the
+  // view/settings actually change, via setTimeout(0) so the "Rendering…"
+  // status has a chance to paint before the (synchronous, potentially
+  // slow at high iteration counts) pixel loop blocks the main thread.
+  // -----------------------------------------------------------------
+  let renderScheduled = false;
+  function scheduleRender() {
+    if (renderScheduled) return;
+    renderScheduled = true;
+    statusEl.classList.add("visible");
+    setTimeout(() => {
+      renderMandelbrot();
+      updateReadout();
+      statusEl.classList.remove("visible");
+      renderScheduled = false;
+    }, 0);
+  }
+
+  function updateReadout() {
+    const zoom = DEFAULT_VIEW.viewWidth / view.viewWidth;
+    readoutEl.textContent =
+      `center: ${view.centerX.toFixed(6)} ${view.centerY >= 0 ? "+" : ""}${view.centerY.toFixed(6)}i\n` +
+      `zoom: ${zoom.toFixed(1)}x   iterations: ${maxIter}`;
+  }
+
+  function resize() {
+    W = window.innerWidth; H = window.innerHeight;
+    canvas.width = Math.floor(W * dpr);
+    canvas.height = Math.floor(H * dpr);
+    canvas.style.width = W + "px";
+    canvas.style.height = H + "px";
+    scheduleRender();
+  }
+
+  // -----------------------------------------------------------------
+  // interaction: zoom toward cursor, click-drag pan
+  // -----------------------------------------------------------------
+  function canvasPixelFromEvent(e) {
+    const rect = canvas.getBoundingClientRect();
+    const x = (e.clientX - rect.left) * (canvas.width / rect.width);
+    const y = (e.clientY - rect.top) * (canvas.height / rect.height);
+    return { x, y };
+  }
+
+  canvas.addEventListener("wheel", (e) => {
+    e.preventDefault();
+    const { x, y } = canvasPixelFromEvent(e);
+    const before = pixelToComplex(x, y, view, canvas.width, canvas.height);
+
+    const zoomFactor = e.deltaY < 0 ? 0.8 : 1.25;
+    view.viewWidth *= zoomFactor;
+
+    const scale = view.viewWidth / canvas.width;
+    view.centerX = before.re - (x - canvas.width / 2) * scale;
+    view.centerY = before.im - (y - canvas.height / 2) * scale;
+
+    scheduleRender();
+  }, { passive: false });
+
+  let dragging = false;
+  let dragStart = null;
+  let dragStartView = null;
+
+  canvas.addEventListener("mousedown", (e) => {
+    dragging = true;
+    canvas.classList.add("dragging");
+    dragStart = canvasPixelFromEvent(e);
+    dragStartView = { ...view };
+  });
+
+  window.addEventListener("mousemove", (e) => {
+    if (dragging) {
+      const cur = canvasPixelFromEvent(e);
+      const scale = view.viewWidth / canvas.width;
+      view.centerX = dragStartView.centerX - (cur.x - dragStart.x) * scale;
+      view.centerY = dragStartView.centerY - (cur.y - dragStart.y) * scale;
+      scheduleRender();
+    }
+    if (juliaEnabled) {
+      const { x, y } = canvasPixelFromEvent(e);
+      if (x >= 0 && x < canvas.width && y >= 0 && y < canvas.height) {
+        const c = pixelToComplex(x, y, view, canvas.width, canvas.height);
+        renderJulia(c.re, c.im);
+      }
+    }
+  });
+
+  window.addEventListener("mouseup", () => {
+    dragging = false;
+    canvas.classList.remove("dragging");
+  });
+
+  window.addEventListener("resize", resize);
+
+  // -----------------------------------------------------------------
+  // UI wiring
+  // -----------------------------------------------------------------
+  document.getElementById("resetBtn").addEventListener("click", () => {
+    view = { ...DEFAULT_VIEW };
+    scheduleRender();
+  });
+
+  document.getElementById("saveBtn").addEventListener("click", () => {
+    const link = document.createElement("a");
+    link.download = "fractal.png";
+    link.href = canvas.toDataURL("image/png");
+    link.click();
+  });
+
+  const iterSlider = document.getElementById("iterSlider");
+  const iterLabel = document.getElementById("iterLabel");
+  iterSlider.addEventListener("input", (e) => {
+    maxIter = parseInt(e.target.value, 10);
+    iterLabel.textContent = maxIter;
+    scheduleRender();
+  });
+
+  document.getElementById("paletteSelect").addEventListener("change", (e) => {
+    paletteName = e.target.value;
+    scheduleRender();
+  });
+
+  const juliaToggle = document.getElementById("juliaToggle");
+  const juliaLabel = document.getElementById("juliaLabel");
+  juliaToggle.addEventListener("change", (e) => {
+    juliaEnabled = e.target.checked;
+    juliaCanvas.classList.toggle("visible", juliaEnabled);
+    juliaLabel.classList.toggle("visible", juliaEnabled);
+  });
+
+  // If the page is opened in a background tab (e.g. a middle-clicked
+  // link), browsers throttle/stall setTimeout in hidden tabs — confirmed
+  // directly while building this. Without this listener the canvas could
+  // sit blank until something else happens to trigger a render. Firing a
+  // render the moment the tab actually becomes visible closes that gap.
+  document.addEventListener("visibilitychange", () => {
+    if (!document.hidden) scheduleRender();
+  });
+
+  // -----------------------------------------------------------------
+  // boot
+  // -----------------------------------------------------------------
+  resize();
+})();
+</script>
+</body>
+</html>
