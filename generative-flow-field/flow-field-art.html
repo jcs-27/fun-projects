@@ -1,0 +1,350 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Flow Field</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root {
+    --bg: #08090d;
+    --panel: rgba(20, 22, 30, 0.72);
+    --text: #e8e9ee;
+    --muted: #9aa0ad;
+    --accent: #7dd3fc;
+    --accent-strong: #38bdf8;
+    --border: rgba(255,255,255,0.10);
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; padding: 0; width: 100%; height: 100%;
+    background: var(--bg); color: var(--text);
+    font-family: -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    overflow: hidden;
+  }
+  #stage { display: block; width: 100vw; height: 100vh; background: var(--bg); }
+
+  .panel {
+    position: fixed; top: 16px; left: 16px;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 14px 16px;
+    backdrop-filter: blur(10px);
+    -webkit-backdrop-filter: blur(10px);
+    display: flex; flex-direction: column; gap: 10px;
+    min-width: 220px;
+  }
+  .panel h1 {
+    font-size: 13px; font-weight: 600; letter-spacing: 0.04em;
+    text-transform: uppercase; color: var(--muted); margin: 0 0 2px 0;
+  }
+  .row { display: flex; gap: 8px; }
+  button {
+    flex: 1;
+    background: rgba(255,255,255,0.06);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 8px 10px;
+    font-size: 13px;
+    cursor: pointer;
+    transition: background 0.15s ease, border-color 0.15s ease;
+  }
+  button:hover { background: rgba(255,255,255,0.12); border-color: rgba(255,255,255,0.22); }
+  button:active { transform: translateY(1px); }
+  button.primary { background: var(--accent-strong); color: #07131a; border-color: var(--accent-strong); font-weight: 600; }
+  button.primary:hover { background: var(--accent); }
+
+  label { font-size: 12px; color: var(--muted); display: flex; justify-content: space-between; }
+  input[type="range"] { width: 100%; accent-color: var(--accent-strong); }
+
+  .hint { font-size: 11px; color: var(--muted); line-height: 1.5; margin-top: 2px; }
+  .seed { font-size: 11px; color: var(--muted); font-variant-numeric: tabular-nums; }
+
+  .collapsed .panel-body { display: none; }
+  .toggle {
+    position: absolute; top: 10px; right: 10px;
+    background: transparent; border: none; color: var(--muted);
+    font-size: 16px; cursor: pointer; padding: 2px 6px; flex: none; width: auto;
+  }
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+
+<div class="panel" id="panel">
+  <button class="toggle" id="toggleBtn" title="Collapse/expand" aria-label="Collapse panel">−</button>
+  <h1>Flow Field</h1>
+  <div class="panel-body" id="panelBody">
+    <div class="row">
+      <button class="primary" id="regenBtn">⟳ Regenerate</button>
+      <button id="saveBtn">⬇ Save PNG</button>
+    </div>
+    <div class="row">
+      <button id="pauseBtn">⏸ Pause</button>
+      <button id="clearBtn">✕ Clear trails</button>
+    </div>
+    <label>Particles <span id="particleCountLabel">1200</span>
+      <input type="range" id="particleCount" min="200" max="3000" step="100" value="1200">
+    </label>
+    <label>Noise scale <span id="scaleLabel">0.0035</span>
+      <input type="range" id="noiseScale" min="10" max="120" step="1" value="35">
+    </label>
+    <label>Speed <span id="speedLabel">1.6</span>
+      <input type="range" id="speed" min="2" max="40" step="1" value="16">
+    </label>
+    <div class="hint">Each particle drifts along a Perlin noise vector field. Regenerate picks a new seed; drag the sliders to reshape the flow live.</div>
+    <div class="seed" id="seedLabel">seed: —</div>
+  </div>
+</div>
+
+<script>
+(() => {
+  "use strict";
+
+  // ---------------------------------------------------------------------
+  // seeded PRNG (mulberry32) — deterministic per seed, so "Regenerate"
+  // reliably produces a reproducible-if-you-note-the-seed result instead
+  // of relying on Math.random() (which can't be seeded).
+  // ---------------------------------------------------------------------
+  function mulberry32(seed) {
+    return function () {
+      seed |= 0; seed = (seed + 0x6D2B79F5) | 0;
+      let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  // ---------------------------------------------------------------------
+  // classic Perlin noise (2D), permutation table built from the seeded RNG
+  // ---------------------------------------------------------------------
+  class Perlin {
+    constructor(rng) {
+      const p = new Uint8Array(256);
+      for (let i = 0; i < 256; i++) p[i] = i;
+      for (let i = 255; i > 0; i--) {
+        const j = Math.floor(rng() * (i + 1));
+        [p[i], p[j]] = [p[j], p[i]];
+      }
+      this.perm = new Uint8Array(512);
+      for (let i = 0; i < 512; i++) this.perm[i] = p[i & 255];
+    }
+    static fade(t) { return t * t * t * (t * (t * 6 - 15) + 10); }
+    static lerp(t, a, b) { return a + t * (b - a); }
+    static grad(hash, x, y) {
+      const h = hash & 7;
+      const u = h < 4 ? x : y;
+      const v = h < 4 ? y : x;
+      return ((h & 1) ? -u : u) + ((h & 2) ? -2 * v : 2 * v);
+    }
+    noise2(x, y) {
+      const X = Math.floor(x) & 255, Y = Math.floor(y) & 255;
+      x -= Math.floor(x); y -= Math.floor(y);
+      const u = Perlin.fade(x), v = Perlin.fade(y);
+      const perm = this.perm;
+      const aa = perm[X + perm[Y]], ab = perm[X + perm[Y + 1]];
+      const ba = perm[X + 1 + perm[Y]], bb = perm[X + 1 + perm[Y + 1]];
+      const x1 = Perlin.lerp(u, Perlin.grad(aa, x, y), Perlin.grad(ba, x - 1, y));
+      const x2 = Perlin.lerp(u, Perlin.grad(ab, x, y - 1), Perlin.grad(bb, x - 1, y - 1));
+      return Perlin.lerp(v, x1, x2); // roughly in [-1, 1]
+    }
+  }
+
+  // ---------------------------------------------------------------------
+  // canvas + state
+  // ---------------------------------------------------------------------
+  const canvas = document.getElementById("stage");
+  const ctx = canvas.getContext("2d");
+  let dpr = Math.max(1, Math.min(2, window.devicePixelRatio || 1));
+
+  let W = 0, H = 0;
+  function resize() {
+    W = window.innerWidth; H = window.innerHeight;
+    canvas.width = Math.floor(W * dpr);
+    canvas.height = Math.floor(H * dpr);
+    canvas.style.width = W + "px";
+    canvas.style.height = H + "px";
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+
+  const PALETTE = ["#7dd3fc", "#38bdf8", "#a78bfa", "#f472b6", "#fbbf24", "#34d399"];
+
+  let state = {
+    seed: 1,
+    rng: null,
+    perlin: null,
+    particles: [],
+    particleCount: 1200,
+    noiseScale: 35,   // divisor: higher = smoother, larger-scale swirls
+    speed: 16,         // px/sec-ish per frame step
+    paused: false,
+    t: 0,
+  };
+
+  function randomSeed() {
+    return (Date.now() ^ Math.floor(Math.random() * 0xffffffff)) >>> 0;
+  }
+
+  function makeParticle(rng) {
+    return {
+      x: rng() * W,
+      y: rng() * H,
+      color: PALETTE[Math.floor(rng() * PALETTE.length)],
+      life: 200 + Math.floor(rng() * 400),
+      age: 0,
+    };
+  }
+
+  function initField(seed) {
+    state.seed = seed;
+    state.rng = mulberry32(seed);
+    state.perlin = new Perlin(state.rng);
+    state.particles = [];
+    for (let i = 0; i < state.particleCount; i++) {
+      state.particles.push(makeParticle(state.rng));
+    }
+    document.getElementById("seedLabel").textContent = "seed: " + seed;
+    clearTrails();
+  }
+
+  function clearTrails() {
+    ctx.fillStyle = "#08090d";
+    ctx.fillRect(0, 0, W, H);
+  }
+
+  function angleAt(x, y) {
+    const n = state.perlin.noise2(x / state.noiseScale / 10, y / state.noiseScale / 10 + state.t * 0.03);
+    return n * Math.PI * 4; // a few full rotations across the noise range for varied swirl
+  }
+
+  function step() {
+    if (state.paused) return;
+    state.t += 1;
+
+    // fade previous frame slightly instead of clearing — this is what
+    // produces the trailing streaks rather than a field of disconnected dots
+    ctx.fillStyle = "rgba(8, 9, 13, 0.06)";
+    ctx.fillRect(0, 0, W, H);
+
+    const speed = state.speed / 10;
+    for (const p of state.particles) {
+      const a = angleAt(p.x, p.y);
+      const nx = p.x + Math.cos(a) * speed;
+      const ny = p.y + Math.sin(a) * speed;
+
+      ctx.strokeStyle = p.color;
+      ctx.globalAlpha = 0.5;
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(p.x, p.y);
+      ctx.lineTo(nx, ny);
+      ctx.stroke();
+      ctx.globalAlpha = 1;
+
+      p.x = nx; p.y = ny; p.age++;
+
+      const offscreen = p.x < -10 || p.x > W + 10 || p.y < -10 || p.y > H + 10;
+      if (offscreen || p.age > p.life) {
+        p.x = state.rng() * W;
+        p.y = state.rng() * H;
+        p.age = 0;
+        p.life = 200 + Math.floor(state.rng() * 400);
+        p.color = PALETTE[Math.floor(state.rng() * PALETTE.length)];
+      }
+    }
+  }
+
+  function loop() {
+    step();
+    requestAnimationFrame(loop);
+  }
+
+  // ---------------------------------------------------------------------
+  // UI wiring
+  // ---------------------------------------------------------------------
+  function syncParticleCount(newCount) {
+    const cur = state.particles.length;
+    if (newCount > cur) {
+      for (let i = cur; i < newCount; i++) state.particles.push(makeParticle(state.rng));
+    } else if (newCount < cur) {
+      state.particles.length = newCount;
+    }
+    state.particleCount = newCount;
+  }
+
+  window.addEventListener("resize", () => {
+    const oldW = W, oldH = H;
+    resize();
+    // re-scatter particles proportionally so a resize doesn't pile them in a corner
+    if (oldW && oldH) {
+      for (const p of state.particles) {
+        p.x = (p.x / oldW) * W;
+        p.y = (p.y / oldH) * H;
+      }
+    }
+    clearTrails();
+  });
+
+  document.getElementById("regenBtn").addEventListener("click", () => {
+    initField(randomSeed());
+  });
+
+  document.getElementById("clearBtn").addEventListener("click", clearTrails);
+
+  document.getElementById("pauseBtn").addEventListener("click", (e) => {
+    state.paused = !state.paused;
+    e.target.textContent = state.paused ? "▶ Resume" : "⏸ Pause";
+  });
+
+  document.getElementById("saveBtn").addEventListener("click", () => {
+    const link = document.createElement("a");
+    link.download = "flow-field-" + state.seed + ".png";
+    link.href = canvas.toDataURL("image/png");
+    link.click();
+  });
+
+  const particleSlider = document.getElementById("particleCount");
+  const particleLabel = document.getElementById("particleCountLabel");
+  particleSlider.addEventListener("input", (e) => {
+    const v = parseInt(e.target.value, 10);
+    particleLabel.textContent = v;
+    syncParticleCount(v);
+  });
+
+  const scaleSlider = document.getElementById("noiseScale");
+  const scaleLabel = document.getElementById("scaleLabel");
+  scaleSlider.addEventListener("input", (e) => {
+    state.noiseScale = parseInt(e.target.value, 10);
+    scaleLabel.textContent = state.noiseScale;
+  });
+
+  const speedSlider = document.getElementById("speed");
+  const speedLabel = document.getElementById("speedLabel");
+  speedSlider.addEventListener("input", (e) => {
+    state.speed = parseInt(e.target.value, 10);
+    speedLabel.textContent = (state.speed / 10).toFixed(1);
+  });
+
+  // sync labels to their sliders' actual current values on load, rather than
+  // trusting the hardcoded placeholder text in the HTML to stay in sync
+  particleLabel.textContent = particleSlider.value;
+  scaleLabel.textContent = scaleSlider.value;
+  speedLabel.textContent = (parseInt(speedSlider.value, 10) / 10).toFixed(1);
+
+  document.getElementById("toggleBtn").addEventListener("click", (e) => {
+    const panel = document.getElementById("panel");
+    panel.classList.toggle("collapsed");
+    e.target.textContent = panel.classList.contains("collapsed") ? "+" : "−";
+  });
+
+  // ---------------------------------------------------------------------
+  // boot
+  // ---------------------------------------------------------------------
+  resize();
+  initField(randomSeed());
+  requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>
